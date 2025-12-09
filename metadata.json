@@ -1,0 +1,7 @@
+{
+  "name": "My Board",
+  "description": "A digital teaching board application for presenting slides, annotating in real-time, and utilizing Gemini AI for teaching assistance.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
