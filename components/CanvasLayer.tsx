@@ -12,6 +12,9 @@ interface CanvasLayerProps {
   onSave: (dataUrl: string) => void;
 }
 
+const HANDLE_RADIUS = 5;
+const HIT_TOLERANCE = 10;
+
 export const CanvasLayer: React.FC<CanvasLayerProps> = ({
   width,
   height,
@@ -40,7 +43,8 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
   // Selection Tool Refs
   const selectionRef = useRef<{ canvas: HTMLCanvasElement, x: number, y: number, w: number, h: number } | null>(null);
   const bgSnapshotRef = useRef<ImageData | null>(null); // Canvas state with the "hole" where selection was lifted
-  
+  const resizingHandleRef = useRef<string | null>(null); // 'nw', 'ne', 'se', 'sw'
+
   // Internal Clipboard
   const clipboardRef = useRef<{ canvas: HTMLCanvasElement, w: number, h: number } | null>(null);
 
@@ -55,6 +59,19 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
 
   // Ref to track if the current update was initiated by this component
   const skipNextRedraw = useRef(false);
+
+  // Helper to detect if point is over a handle
+  const getHandleAtPosition = (x: number, y: number, rect: { x: number, y: number, w: number, h: number }) => {
+    const handles = [
+      { id: 'nw', cx: rect.x, cy: rect.y },
+      { id: 'ne', cx: rect.x + rect.w, cy: rect.y },
+      { id: 'se', cx: rect.x + rect.w, cy: rect.y + rect.h },
+      { id: 'sw', cx: rect.x, cy: rect.y + rect.h }
+    ];
+    return handles.find(h => 
+      Math.abs(x - h.cx) <= HIT_TOLERANCE && Math.abs(y - h.cy) <= HIT_TOLERANCE
+    );
+  };
 
   // Initialize canvas context
   useEffect(() => {
@@ -102,6 +119,7 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
     // Reset selection and points when slide changes
     selectionRef.current = null;
     bgSnapshotRef.current = null;
+    resizingHandleRef.current = null;
     pointsRef.current = [];
     setSelectionMenu(null);
     setTextInput({ x: 0, y: 0, text: '', visible: false });
@@ -137,13 +155,35 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
       ctx.save();
       ctx.shadowBlur = 10;
       ctx.shadowColor = 'rgba(0,0,0,0.2)';
-      ctx.drawImage(canvas, x, y);
+      // Draw image scaled to current w/h
+      ctx.drawImage(canvas, x, y, w, h);
       
       // Draw dashed border
       ctx.strokeStyle = '#6366f1';
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 1;
       ctx.setLineDash([6, 6]);
       ctx.strokeRect(x, y, w, h);
+      
+      // Draw resize handles
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = '#6366f1';
+      ctx.lineWidth = 1;
+      
+      const handles = [
+        { x: x, y: y },           // nw
+        { x: x + w, y: y },       // ne
+        { x: x + w, y: y + h },   // se
+        { x: x, y: y + h }        // sw
+      ];
+      
+      handles.forEach(h => {
+        ctx.beginPath();
+        ctx.arc(h.x, h.y, HANDLE_RADIUS, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      });
+
       ctx.restore();
     }
   };
@@ -158,14 +198,16 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
       ctx.putImageData(bgSnapshotRef.current, 0, 0);
     }
 
-    const { canvas, x, y } = selectionRef.current;
+    const { canvas, x, y, w, h } = selectionRef.current;
     ctx.save();
     ctx.shadowBlur = 0;
-    ctx.drawImage(canvas, x, y);
+    // Draw using current dimensions (applies resize)
+    ctx.drawImage(canvas, x, y, w, h);
     ctx.restore();
 
     selectionRef.current = null;
     bgSnapshotRef.current = null;
+    resizingHandleRef.current = null;
     setSelectionMenu(null);
     setShowColorPicker(false);
     
@@ -361,10 +403,21 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
 
     if (activeTool === ToolType.SELECT) {
       if (selectionRef.current) {
+        // Check for handle clicks first
+        const handle = getHandleAtPosition(coords.x, coords.y, selectionRef.current);
+        if (handle) {
+          setIsDrawing(true);
+          resizingHandleRef.current = handle.id;
+          lastPos.current = coords;
+          setSelectionMenu(null);
+          return;
+        }
+
         const { x, y, w, h } = selectionRef.current;
         // Check if clicking inside selection to move it
         if (coords.x >= x && coords.x <= x + w && coords.y >= y && coords.y <= y + h) {
           setIsDrawing(true);
+          resizingHandleRef.current = null;
           lastPos.current = coords;
           setSelectionMenu(null); // Hide menu while dragging
           return;
@@ -384,6 +437,8 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
     setIsDrawing(true);
     lastPos.current = coords;
     startPos.current = coords;
+    
+    // Initialize points for smoothing
     pointsRef.current = [coords];
     lastDrawTimeRef.current = Date.now();
 
@@ -391,6 +446,7 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
       const dpr = window.devicePixelRatio || 1;
       snapshotRef.current = ctx.getImageData(0, 0, width * dpr, height * dpr);
     } else {
+      // For PEN/ERASER, we prepare context but don't draw yet (wait for movement)
       applyContextStyles(ctx);
       ctx.beginPath();
       ctx.moveTo(coords.x, coords.y);
@@ -399,6 +455,24 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
 
   const draw = (e: React.MouseEvent | React.TouchEvent) => {
     const { x, y } = getCoordinates(e);
+
+    // Update cursor for selection tool
+    if (activeTool === ToolType.SELECT && selectionRef.current && !isDrawing) {
+      const handle = getHandleAtPosition(x, y, selectionRef.current);
+      if (handle) {
+        if (handle.id === 'nw' || handle.id === 'se') canvasRef.current!.style.cursor = 'nwse-resize';
+        else if (handle.id === 'ne' || handle.id === 'sw') canvasRef.current!.style.cursor = 'nesw-resize';
+      } else {
+        const { x: sx, y: sy, w, h } = selectionRef.current;
+        if (x >= sx && x <= sx + w && y >= sy && y <= sy + h) {
+          canvasRef.current!.style.cursor = 'move';
+        } else {
+          canvasRef.current!.style.cursor = 'crosshair';
+        }
+      }
+    } else if (activeTool === ToolType.SELECT && !selectionRef.current) {
+      if (canvasRef.current) canvasRef.current.style.cursor = 'crosshair';
+    }
 
     if (activeTool === ToolType.LASER) {
       laserPointsRef.current.push({ x, y, time: Date.now() });
@@ -414,11 +488,37 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
         if (!bgSnapshotRef.current || !lastPos.current) return;
         const dx = x - lastPos.current.x;
         const dy = y - lastPos.current.y;
-        selectionRef.current.x += dx;
-        selectionRef.current.y += dy;
+
+        if (resizingHandleRef.current) {
+          // Resize Logic
+          const handle = resizingHandleRef.current;
+          const sel = selectionRef.current;
+          
+          if (handle.includes('e')) sel.w += dx;
+          if (handle.includes('w')) {
+            sel.x += dx;
+            sel.w -= dx;
+          }
+          if (handle.includes('s')) sel.h += dy;
+          if (handle.includes('n')) {
+            sel.y += dy;
+            sel.h -= dy;
+          }
+
+          // Enforce minimum size to avoid flipping issues
+          if (sel.w < 10) sel.w = 10;
+          if (sel.h < 10) sel.h = 10;
+
+        } else {
+          // Move Logic
+          selectionRef.current.x += dx;
+          selectionRef.current.y += dy;
+        }
+
         lastPos.current = { x, y };
         redrawScene();
       } else {
+        // Creating new selection box
         if (!startPos.current || !snapshotRef.current) return;
         ctx.putImageData(snapshotRef.current, 0, 0);
         const startX = startPos.current.x;
@@ -458,35 +558,69 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
       return;
     } 
     
+    // --- PEN / ERASER LOGIC ---
     if (activeTool === ToolType.PEN || activeTool === ToolType.ERASER) {
+      
+      // 1. Point Filtering (Smoothing)
+      // Check distance from last saved point to avoid jitter/crowding
+      const lastPoint = pointsRef.current.length > 0 ? pointsRef.current[pointsRef.current.length - 1] : null;
+      if (lastPoint) {
+        const dist = Math.hypot(x - lastPoint.x, y - lastPoint.y);
+        // Minimum distance of 4px for smoothing
+        if (dist < 4) return;
+      }
+
+      // Add point
       pointsRef.current.push({ x, y });
       const points = pointsRef.current;
+      
+      // Need at least 3 points to start a curve (p1, p2, p3)
       if (points.length < 3) return;
 
       const p1 = points[points.length - 3];
       const p2 = points[points.length - 2];
       const p3 = points[points.length - 1];
-      const mid1 = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
-      const mid2 = { x: (p2.x + p3.x) / 2, y: (p2.y + p3.y) / 2 };
 
       applyContextStyles(ctx);
 
+      // Dynamic Width Calculation
       if (activeTool === ToolType.PEN && penStyle.effect === 'normal') {
         const now = Date.now();
         const dt = now - lastDrawTimeRef.current;
-        const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        // Distance between p2 and p3 (current segment being processed approx)
+        const dist = Math.hypot(p3.x - p2.x, p3.y - p2.y);
         const velocity = dist / (dt || 1);
         lastDrawTimeRef.current = now;
-        const speedFactor = Math.max(0, Math.min(1, velocity * 0.1));
+        
+        // Simple inverse speed mapping: faster = thinner
+        const speedFactor = Math.max(0, Math.min(1, velocity * 0.15));
         const dynamicWidth = penStyle.size * (1.2 - speedFactor * 0.6);
         ctx.lineWidth = dynamicWidth;
       }
 
       ctx.beginPath();
-      ctx.moveTo(mid1.x, mid1.y);
-      ctx.quadraticCurveTo(p2.x, p2.y, mid2.x, mid2.y);
+      
+      // Bezier Smoothing Logic
+      if (points.length === 3) {
+        // Special case for the start of the stroke
+        // Draw from p1 to the midpoint of p2-p3
+        ctx.moveTo(p1.x, p1.y);
+        const mid = { x: (p2.x + p3.x) / 2, y: (p2.y + p3.y) / 2 };
+        ctx.quadraticCurveTo(p2.x, p2.y, mid.x, mid.y);
+      } else {
+        // Standard case: Continue from previous midpoint
+        // Midpoint 1: between p1 and p2 (where we left off)
+        const mid1 = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+        // Midpoint 2: between p2 and p3 (new destination)
+        const mid2 = { x: (p2.x + p3.x) / 2, y: (p2.y + p3.y) / 2 };
+        
+        ctx.moveTo(mid1.x, mid1.y);
+        ctx.quadraticCurveTo(p2.x, p2.y, mid2.x, mid2.y);
+      }
+      
       ctx.stroke();
 
+      // Neon Effect Particles
       if (activeTool === ToolType.PEN && penStyle.effect === 'neon' && Math.random() > 0.85) {
         ctx.save();
         ctx.fillStyle = '#ffffff';
@@ -516,27 +650,44 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
     
     const ctx = contextRef.current;
     
-    if ((activeTool === ToolType.PEN || activeTool === ToolType.ERASER) && pointsRef.current.length > 2 && ctx) {
+    // Finish the stroke for Pen/Eraser
+    if ((activeTool === ToolType.PEN || activeTool === ToolType.ERASER) && ctx && pointsRef.current.length > 0) {
        const points = pointsRef.current;
-       const pLast = points[points.length - 1];
-       const pPrev = points[points.length - 2];
-       const mid = { x: (pPrev.x + pLast.x) / 2, y: (pPrev.y + pLast.y) / 2 };
        applyContextStyles(ctx);
+       
        ctx.beginPath();
-       ctx.moveTo(mid.x, mid.y);
-       ctx.lineTo(pLast.x, pLast.y);
-       ctx.stroke();
+       if (points.length === 1) {
+         // Draw a dot if only one point
+         ctx.fillStyle = ctx.strokeStyle; 
+         ctx.arc(points[0].x, points[0].y, ctx.lineWidth / 2, 0, Math.PI * 2);
+         ctx.fill();
+       } else if (points.length === 2) {
+         // Draw a simple line if only two points
+         ctx.moveTo(points[0].x, points[0].y);
+         ctx.lineTo(points[1].x, points[1].y);
+         ctx.stroke();
+       } else {
+         const pLast = points[points.length - 1];
+         const pPrev = points[points.length - 2];
+         const mid = { x: (pPrev.x + pLast.x) / 2, y: (pPrev.y + pLast.y) / 2 };
+         
+         ctx.moveTo(mid.x, mid.y);
+         ctx.lineTo(pLast.x, pLast.y);
+         ctx.stroke();
+       }
     }
     
     pointsRef.current = [];
 
     if (activeTool === ToolType.SELECT && ctx && canvasRef.current) {
       if (selectionRef.current) {
+        // Just finished moving or resizing
         setSelectionMenu({ 
           x: selectionRef.current.x, 
           y: selectionRef.current.y,
           w: selectionRef.current.w
         });
+        resizingHandleRef.current = null;
         return; 
       }
       
@@ -583,6 +734,7 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
     lastPos.current = null;
     startPos.current = null;
     snapshotRef.current = null;
+    resizingHandleRef.current = null;
     
     if (activeTool !== ToolType.TEXT && canvasRef.current) {
       skipNextRedraw.current = true;
@@ -595,11 +747,16 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
   const copySelection = () => {
     if (!selectionRef.current) return;
     const { canvas, w, h } = selectionRef.current;
+    
+    // Create a new canvas that respects the current visual size (w, h)
     const copyC = document.createElement('canvas');
     copyC.width = w;
     copyC.height = h;
     const ctx = copyC.getContext('2d');
-    if (ctx) ctx.drawImage(canvas, 0, 0);
+    if (ctx) {
+      // Draw the original content scaled to the new dimensions
+      ctx.drawImage(canvas, 0, 0, w, h);
+    }
     clipboardRef.current = { canvas: copyC, w, h };
   };
 
@@ -621,6 +778,7 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
     bgSnapshotRef.current = ctx.getImageData(0, 0, width * dpr, height * dpr);
 
     // 3. Create new selection
+    // Note: clipCanvas is already sized correctly from copy
     const pasteC = document.createElement('canvas');
     pasteC.width = w;
     pasteC.height = h;
@@ -655,9 +813,10 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
     ctx.putImageData(bgSnapshotRef.current, 0, 0);
     
     // 2. Stamp current selection into background
+    // Must use current w/h to stamp the resized version
     ctx.save();
     ctx.shadowBlur = 0;
-    ctx.drawImage(selectionRef.current.canvas, selectionRef.current.x, selectionRef.current.y);
+    ctx.drawImage(selectionRef.current.canvas, selectionRef.current.x, selectionRef.current.y, selectionRef.current.w, selectionRef.current.h);
     ctx.restore();
 
     // 3. Update snapshot to include the stamp
@@ -750,7 +909,7 @@ export const CanvasLayer: React.FC<CanvasLayerProps> = ({
         onTouchEnd={stopDrawing}
         className={`absolute top-0 left-0 w-full h-full touch-none 
           ${activeTool === ToolType.POINTER ? 'pointer-events-none' : 
-            activeTool === ToolType.SELECT ? 'cursor-crosshair' : 
+            activeTool === ToolType.SELECT ? '' : // Cursor handled in logic 
             activeTool === ToolType.LASER ? 'cursor-none' :
             activeTool === ToolType.TEXT ? 'cursor-text' : 
             'cursor-crosshair'}`}

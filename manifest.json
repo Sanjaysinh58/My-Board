@@ -1,0 +1,22 @@
+{
+  "name": "EduBoard AI",
+  "short_name": "EduBoard",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#121212",
+  "theme_color": "#121212",
+  "description": "AI-powered Teaching Board",
+  "orientation": "landscape",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/2201/2201569.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/2201/2201569.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
